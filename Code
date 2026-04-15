@@ -1,0 +1,585 @@
+import { useState, useEffect, useRef } from "react";
+
+// ── API KEYS ─────────────────────────────────────────────────────────────────
+const ALPHA_VANTAGE_KEY  = "";
+const FMP_KEY            = "";
+const LANGFLOW_URL       = "https://langflow.siagpt.ai/api/v1/run/b708a50f-cfed-44c7-a212-f0097d83c1a8";
+const LANGFLOW_API_KEY   = "";
+
+// ── PROMPTS ──────────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `Tu es un conseiller financier d'élite combinant les expertises de Goldman Sachs, Morgan Stanley, Bridgewater, BlackRock, JPMorgan, Citadel, Harvard Endowment, Bain & Company, Renaissance Technologies et McKinsey Global Institute.
+
+L'utilisateur gère un PEA (Plan d'Épargne en Actions) français. Le capital, l'objectif de rendement, la tolérance au risque et l'horizon d'investissement sont propres à chaque utilisateur — adapte toujours tes recommandations à son profil réel. Si ces informations n'ont pas encore été fournies, demande-les avant de proposer une allocation.
+
+CONTRAINTES PEA:
+- Seules les actions européennes et ETF éligibles PEA sont autorisés
+- Pas d'actions américaines directes (sauf via ETF éligibles PEA)
+- Fiscalité avantageuse après 5 ans (flat tax 17,2%)
+
+Tu as accès à 10 modules: Stock Screener (GS), DCF (MS), Risk (Bridgewater), Earnings (JPM), Portfolio (BlackRock), Technical (Citadel), Dividends (Harvard), Competitive (Bain), Patterns (Renaissance), Macro (McKinsey).
+
+RÈGLE ALLOCATION: Quand tu proposes une allocation complète, termine OBLIGATOIREMENT par ce bloc (sans backticks):
+<ALLOCATION_JSON>
+[{"ticker":"CW8.PA","nom":"Amundi MSCI World PEA","categorie":"ETF World","montant":30000,"cible":30}]
+</ALLOCATION_JSON>
+Catégories: ETF World, ETF Emergents, Action Europe, Dividendes, Cash.
+Pour les actions françaises utilise le suffixe .PA (ex: MC.PA), allemandes .DE, etc.`;
+
+const REALLOC_PROMPT = `Tu es un conseiller PEA expert. Analyse le portefeuille fourni et propose un rééquilibrage mensuel précis: conserver/renforcer/alléger/vendre pour chaque ligne avec justification et montants en euros.`;
+
+const QUICK_PROMPTS = [
+  { icon:"📊", label:"Allocation optimale", text:"Donne-moi une allocation optimale pour mon PEA. Propose une liste complète de lignes avec les montants à investir." },
+  { icon:"🔍", label:"Stock Screener", text:"Lance le stock screener Goldman Sachs pour les 10 meilleures actions éligibles PEA actuellement." },
+  { icon:"⚠️", label:"Analyse des risques", text:"Évalue les risques macro actuels sur mon PEA européen façon Bridgewater." },
+  { icon:"📈", label:"Analyse technique", text:"Analyse technique Citadel sur les ETF PEA principaux (CW8, EWLD, PAEEM)." },
+  { icon:"💰", label:"Dividendes", text:"Construis une poche dividendes façon Harvard Endowment. Objectif: 3-4% de rendement stable." },
+  { icon:"🌍", label:"Rapport macro", text:"Rapport macro McKinsey: impact des conditions actuelles sur mon allocation PEA." },
+  { icon:"🔄", label:"Rééquilibrage", text:"Revue mensuelle de mon PEA. Dois-je rééquilibrer ? Modules macro + technique + risque." },
+  { icon:"🎯", label:"Action du mois", text:"Meilleure opportunité action éligible PEA ce mois via screener GS + DCF Morgan Stanley." },
+];
+
+const CAT_COLORS = {
+  "ETF World":"#c9a96e","ETF Emergents":"#6a8ec9","Action Europe":"#4a9e6b","Dividendes":"#9e4a6b","Cash":"#888"
+};
+
+// ── PRICE FETCHER — 3 sources + médiane ────────────────────────────────────
+async function fetchYahoo(ticker) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
+    const r = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`);
+    const d = await r.json();
+    const price = d?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    return price ? parseFloat(price) : null;
+  } catch { return null; }
+}
+
+async function fetchAlphaVantage(ticker) {
+  if (!ALPHA_VANTAGE_KEY) return null;
+  try {
+    // AV uses base ticker without exchange suffix
+    const sym = ticker.split(".")[0];
+    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${sym}&apikey=${ALPHA_VANTAGE_KEY}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const price = d?.["Global Quote"]?.["05. price"];
+    return price ? parseFloat(price) : null;
+  } catch { return null; }
+}
+
+async function fetchFMP(ticker) {
+  if (!FMP_KEY) return null;
+  try {
+    const sym = ticker.replace(".PA","").replace(".DE","").replace(".MI","").replace(".AS","");
+    const url = `https://financialmodelingprep.com/api/v3/quote-short/${sym}?apikey=${FMP_KEY}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    return d?.[0]?.price ? parseFloat(d[0].price) : null;
+  } catch { return null; }
+}
+
+function median(arr) {
+  const v = arr.filter(x => x !== null && !isNaN(x)).sort((a,b)=>a-b);
+  if (!v.length) return null;
+  const m = Math.floor(v.length/2);
+  return v.length%2 ? v[m] : (v[m-1]+v[m])/2;
+}
+
+async function fetchPrice(ticker) {
+  if (ticker === "CASH") return null;
+  const [y, av, fmp] = await Promise.allSettled([
+    fetchYahoo(ticker), fetchAlphaVantage(ticker), fetchFMP(ticker)
+  ]);
+  const prices = [
+    y.status==="fulfilled" ? y.value : null,
+    av.status==="fulfilled" ? av.value : null,
+    fmp.status==="fulfilled" ? fmp.value : null,
+  ];
+  const med = median(prices);
+  const sources = ["Yahoo","AlphaVantage","FMP"]
+    .filter((_,i) => prices[i] !== null)
+    .map((name,i) => {
+      const idx = ["Yahoo","AlphaVantage","FMP"].indexOf(name);
+      return `${name}: ${prices[idx]?.toFixed(2) ?? "—"}`;
+    });
+  return { price: med, sources, prices };
+}
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+function parseAllocation(content) {
+  const match = content.match(/<ALLOCATION_JSON>([\s\S]*?)<\/ALLOCATION_JSON>/);
+  if (!match) return null;
+  try { return JSON.parse(match[1].trim()); } catch { return null; }
+}
+function stripJson(content) {
+  return content.replace(/<ALLOCATION_JSON>[\s\S]*?<\/ALLOCATION_JSON>/, "").trim();
+}
+
+// ── COMPONENTS ───────────────────────────────────────────────────────────────
+function TypingIndicator() {
+  return (
+    <div style={{ display:"flex", gap:6, padding:"16px 20px" }}>
+      {[0,1,2].map(i=>(
+        <div key={i} style={{ width:8,height:8,borderRadius:"50%",background:"#c9a96e",animation:"bounce 1.2s infinite",animationDelay:`${i*0.2}s` }}/>
+      ))}
+    </div>
+  );
+}
+
+function SourceBadges({ sources }) {
+  if (!sources?.length) return null;
+  const colors = { Yahoo:"#8b6914", AlphaVantage:"#1a5c3a", FMP:"#1a3a5c" };
+  return (
+    <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:4 }}>
+      {sources.map(s => {
+        const [name, val] = s.split(": ");
+        return (
+          <span key={name} style={{ fontSize:10, padding:"1px 7px", borderRadius:20, background:colors[name]+"44", color:colors[name] === "#8b6914" ? "#c9a96e" : colors[name] === "#1a5c3a" ? "#4a9e6b" : "#6a8ec9", border:`1px solid ${colors[name]}44` }}>
+            {name}: {val}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function Message({ msg, onImport }) {
+  const isUser = msg.role === "user";
+  const allocation = !isUser ? parseAllocation(msg.content) : null;
+  const displayText = allocation ? stripJson(msg.content) : msg.content;
+  const [imported, setImported] = useState(msg.imported||false);
+  return (
+    <div style={{ display:"flex", flexDirection:isUser?"row-reverse":"row", gap:12, marginBottom:20, alignItems:"flex-start" }}>
+      <div style={{ width:36,height:36,borderRadius:"50%",flexShrink:0,background:isUser?"linear-gradient(135deg,#c9a96e,#8b6914)":"linear-gradient(135deg,#1a1a2e,#16213e)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:"bold",color:"#fff",border:isUser?"none":"1px solid #c9a96e33" }}>
+        {isUser?"V":"∞"}
+      </div>
+      <div style={{ maxWidth:"78%", display:"flex", flexDirection:"column", gap:8 }}>
+        <div style={{ background:isUser?"linear-gradient(135deg,#1e3a2f,#162b22)":"rgba(15,15,25,0.9)", border:isUser?"1px solid #2d5a3d":"1px solid rgba(201,169,110,0.2)", borderRadius:isUser?"18px 4px 18px 18px":"4px 18px 18px 18px", padding:"14px 18px" }}>
+          <div style={{ fontSize:14,lineHeight:1.7,color:isUser?"#a8d8b0":"#e8e0d0",whiteSpace:"pre-wrap",fontFamily:"Georgia,serif" }}>{displayText}</div>
+          {msg.ts && <div style={{ fontSize:10,color:"#555",marginTop:6,textAlign:isUser?"right":"left" }}>{msg.ts}</div>}
+        </div>
+        {allocation && (
+          <div style={{ background:"rgba(201,169,110,0.06)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:12,padding:"14px 16px" }}>
+            <div style={{ fontSize:11,color:"#c9a96e",letterSpacing:"0.1em",fontWeight:"bold",marginBottom:10 }}>
+              📋 ALLOCATION PROPOSÉE — {allocation.length} lignes · {allocation.reduce((s,l)=>s+l.montant,0).toLocaleString('fr-FR')} €
+            </div>
+            {allocation.map((l,i)=>(
+              <div key={i} style={{ display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:12,marginBottom:6 }}>
+                <span><span style={{ color:"#c9a96e",fontFamily:"monospace",fontWeight:"bold",marginRight:8 }}>{l.ticker}</span><span style={{ color:"#999" }}>{l.nom}</span></span>
+                <span style={{ display:"flex",gap:8,alignItems:"center" }}>
+                  <span style={{ fontSize:10,padding:"1px 7px",borderRadius:20,background:CAT_COLORS[l.categorie]+"22",color:CAT_COLORS[l.categorie] }}>{l.categorie}</span>
+                  <span style={{ color:"#e8e0d0",fontFamily:"monospace" }}>{l.montant.toLocaleString('fr-FR')} €</span>
+                  <span style={{ color:"#888",fontFamily:"monospace" }}>{l.cible}%</span>
+                </span>
+              </div>
+            ))}
+            {imported
+              ? <div style={{ textAlign:"center",fontSize:12,color:"#4a9e6b",padding:8,background:"rgba(74,158,107,0.1)",borderRadius:8,marginTop:10 }}>✓ Importé dans le portefeuille</div>
+              : <button onClick={()=>{onImport(allocation);setImported(true);}} style={{ width:"100%",marginTop:10,background:"linear-gradient(135deg,#c9a96e,#8b6914)",border:"none",borderRadius:8,padding:10,cursor:"pointer",color:"#000",fontWeight:"bold",fontSize:13,fontFamily:"inherit" }}>✦ Valider et importer dans le portefeuille</button>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EditableCell({ value, onSave, suffix="" }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value);
+  const ref = useRef();
+  useEffect(()=>{ if(editing) ref.current?.focus(); },[editing]);
+  return editing
+    ? <input ref={ref} type="number" value={val} onChange={e=>setVal(e.target.value)}
+        onBlur={()=>{onSave(parseFloat(val)||0);setEditing(false);}}
+        onKeyDown={e=>{if(e.key==="Enter"){onSave(parseFloat(val)||0);setEditing(false);}}}
+        style={{ width:80,background:"rgba(201,169,110,0.15)",border:"1px solid #c9a96e",borderRadius:4,color:"#c9a96e",padding:"2px 6px",fontSize:13,fontFamily:"monospace",textAlign:"right" }}/>
+    : <span onClick={()=>{setVal(value);setEditing(true);}} title="Cliquer pour modifier"
+        style={{ cursor:"pointer",borderBottom:"1px dashed rgba(201,169,110,0.4)",paddingBottom:1,fontFamily:"monospace",fontSize:13 }}>
+        {typeof value==="number"?value.toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2}):value}{suffix}
+      </span>;
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────────
+export default function PEAAgent() {
+  const [messages, setMessages] = useState([{
+    role:"assistant",
+    content:"Bienvenue dans votre Agent PEA Elite 🏦\n\nJe combine les méthodologies de 10 grandes institutions financières mondiales pour construire et piloter votre PEA sur mesure.\n\nPour vous proposer une allocation personnalisée et optimale, j'ai besoin de quelques informations :\n\n• 💰 Capital disponible — Quel est le montant total que vous souhaitez investir ?\n• 🎯 Objectif de rendement — Visez-vous la croissance du capital, des dividendes, ou les deux ?\n• ⚖️ Tolérance au risque — Êtes-vous plutôt prudent, modéré ou dynamique ?\n• 🕐 Horizon d'investissement — Sur combien d'années investissez-vous (3 ans, 5 ans, 10 ans+) ?\n• 📅 Fréquence de versement — Investissement unique ou versements réguliers ? Si réguliers, quel montant mensuel ?\n• 🚫 Exclusions éventuelles — Des secteurs ou pays que vous souhaitez éviter ?\n\nPlus vos réponses sont précises, plus l'allocation sera adaptée à votre profil.",
+    ts: new Date().toLocaleString('fr-FR')
+  }]);
+  const [input, setInput]           = useState("");
+  const [loading, setLoading]       = useState(false);
+  const [activeTab, setActiveTab]   = useState("chat");
+  const [lines, setLines]           = useState([]);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newLine, setNewLine]       = useState({ ticker:"",nom:"",categorie:"Action Europe",qte:0,pru:0,prixActuel:0,cible:0 });
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const [priceData, setPriceData]   = useState({}); // ticker -> {price, sources}
+  const [reallocLoading, setReallocLoading] = useState(false);
+  const [reallocResult, setReallocResult]   = useState(null);
+  const [apiWarning, setApiWarning] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  // Persist
+  useEffect(()=>{
+    const load = async()=>{
+      try {
+        const r1 = await window.storage.get("pea_messages");
+        if(r1) setMessages(JSON.parse(r1.value));
+        const r2 = await window.storage.get("pea_lines");
+        if(r2) setLines(JSON.parse(r2.value));
+        const r3 = await window.storage.get("pea_pricedata");
+        if(r3) setPriceData(JSON.parse(r3.value));
+        const r4 = await window.storage.get("pea_lastrefresh");
+        if(r4) setLastRefresh(r4.value);
+      } catch {}
+    };
+    load();
+  },[]);
+
+  useEffect(()=>{ window.storage.set("pea_messages",JSON.stringify(messages)).catch(()=>{}); },[messages]);
+  useEffect(()=>{ window.storage.set("pea_lines",JSON.stringify(lines)).catch(()=>{}); },[lines]);
+  useEffect(()=>{ window.storage.set("pea_pricedata",JSON.stringify(priceData)).catch(()=>{}); },[priceData]);
+  useEffect(()=>{ messagesEndRef.current?.scrollIntoView({behavior:"smooth"}); },[messages,loading]);
+
+  // Check API keys on mount
+  useEffect(()=>{ setApiWarning(!ALPHA_VANTAGE_KEY || !FMP_KEY); },[]);
+
+  // ── Refresh prices
+  async function refreshPrices() {
+    if (!lines.length) return;
+    setRefreshing(true);
+    const tickers = [...new Set(lines.filter(l=>l.ticker!=="CASH").map(l=>l.ticker))];
+    const results = {};
+    await Promise.all(tickers.map(async t => {
+      const data = await fetchPrice(t);
+      if (data?.price) results[t] = data;
+    }));
+    setPriceData(prev => ({ ...prev, ...results }));
+    // Update prixActuel in lines with fresh prices
+    setLines(prev => prev.map(l => {
+      const d = results[l.ticker];
+      return d?.price ? { ...l, prixActuel: parseFloat(d.price.toFixed(2)) } : l;
+    }));
+    const ts = new Date().toLocaleString('fr-FR');
+    setLastRefresh(ts);
+    window.storage.set("pea_lastrefresh", ts).catch(()=>{});
+    setRefreshing(false);
+  }
+
+  // ── Calculations
+  const totalActuel = lines.reduce((s,l)=>s+(l.ticker==="CASH"?l.prixActuel:l.qte*l.prixActuel),0);
+  const totalPRU    = lines.reduce((s,l)=>s+(l.ticker==="CASH"?l.pru:l.qte*l.pru),0);
+  const totalPnL    = totalActuel-totalPRU;
+  const totalPnLPct = totalPRU>0?(totalPnL/totalPRU)*100:0;
+
+  function importAllocation(allocation) {
+    const nl = allocation.map((l,i)=>({ id:Date.now()+i, ticker:l.ticker, nom:l.nom, categorie:l.categorie, qte:1, pru:l.montant, prixActuel:l.montant, cible:l.cible, _pendingQte:l.ticker!=="CASH" }));
+    setLines(nl);
+    setActiveTab("dashboard");
+  }
+  function updateLine(id,field,value) { setLines(prev=>prev.map(l=>l.id===id?{...l,[field]:value}:l)); }
+  function deleteLine(id) { if(confirm("Supprimer ?")) setLines(prev=>prev.filter(l=>l.id!==id)); }
+  function addLine() {
+    if(!newLine.ticker) return;
+    setLines(prev=>[...prev,{...newLine,id:Date.now()}]);
+    setNewLine({ticker:"",nom:"",categorie:"Action Europe",qte:0,pru:0,prixActuel:0,cible:0});
+    setShowAddForm(false);
+  }
+
+  async function sendMessage(text) {
+    const ts = new Date().toLocaleString('fr-FR');
+    const nm = [...messages,{role:"user",content:text,ts}];
+    setMessages(nm); setInput(""); setLoading(true);
+    try {
+      const res = await fetch(LANGFLOW_URL, {
+        method:"POST",
+        headers:{"Content-Type":"application/json","x-api-key":LANGFLOW_API_KEY},
+        body:JSON.stringify({
+          input_value: text,
+          output_type: "chat",
+          input_type: "chat",
+          session_id: "pea-session-001"
+        })
+      });
+      const data = await res.json();
+      const txt = data?.outputs?.[0]?.outputs?.[0]?.results?.message?.text || "Erreur de réponse Langflow.";
+      setMessages(prev=>[...prev,{role:"assistant",content:txt,ts:new Date().toLocaleString('fr-FR')}]);
+    } catch { setMessages(prev=>[...prev,{role:"assistant",content:"Erreur de connexion à Langflow.",ts:new Date().toLocaleString('fr-FR')}]); }
+    setLoading(false);
+  }
+
+  async function runRealloc() {
+    setReallocLoading(true); setReallocResult(null);
+    const portfolio = lineRows.map(l=>`${l.ticker} | ${l.nom} | Valeur: ${Math.round(l.valActuelle).toLocaleString('fr-FR')}€ | Poids: ${l.pctActuel.toFixed(1)}% | Cible: ${l.cible}% | PnL: ${l.pnlPct.toFixed(1)}%`).join("\n");
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:4096,system:REALLOC_PROMPT,
+          messages:[{role:"user",content:`Portefeuille PEA (total: ${Math.round(totalActuel).toLocaleString('fr-FR')}€):\n\n${portfolio}\n\nAnalyse de rééquilibrage mensuel.`}]})
+      });
+      const data = await res.json();
+      setReallocResult(data.content?.[0]?.text||"Erreur.");
+    } catch { setReallocResult("Erreur de connexion."); }
+    setReallocLoading(false);
+  }
+
+  const lineRows = lines.map(l=>{
+    const val  = l.ticker==="CASH"?l.prixActuel:l.qte*l.prixActuel;
+    const pru  = l.ticker==="CASH"?l.pru:l.qte*l.pru;
+    const pnl  = val-pru;
+    const pnlPct = pru>0?(pnl/pru)*100:0;
+    const pct  = totalActuel>0?(val/totalActuel)*100:0;
+    return {...l,valActuelle:val,pnl,pnlPct,pctActuel:pct,ecartCible:pct-l.cible};
+  });
+
+  const hasPending = lines.some(l=>l._pendingQte);
+
+  return (
+    <div style={{ minHeight:"100vh",background:"linear-gradient(135deg,#0a0a0f,#0d1117,#0a0f0a)",fontFamily:"Georgia,serif",color:"#e8e0d0" }}>
+      <style>{`
+        @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-8px)}}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        .msg-in{animation:fadeIn 0.3s ease}
+        textarea:focus,input:focus,select:focus{outline:none}
+        ::-webkit-scrollbar{width:4px;height:4px} ::-webkit-scrollbar-thumb{background:#c9a96e44;border-radius:2px}
+        table{border-collapse:collapse;width:100%}
+        th{font-size:10px;letter-spacing:0.1em;color:#888;text-transform:uppercase;padding:8px 10px;text-align:right;border-bottom:1px solid rgba(201,169,110,0.15);white-space:nowrap}
+        th:first-child,th:nth-child(2){text-align:left}
+        td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.04);text-align:right;font-size:13px;vertical-align:middle}
+        td:first-child,td:nth-child(2){text-align:left}
+        tr:hover td{background:rgba(201,169,110,0.04)}
+      `}</style>
+
+      {/* Header */}
+      <div style={{ borderBottom:"1px solid rgba(201,169,110,0.2)",padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(0,0,0,0.4)",backdropFilter:"blur(20px)",position:"sticky",top:0,zIndex:100 }}>
+        <div style={{ display:"flex",alignItems:"center",gap:12 }}>
+          <div style={{ width:40,height:40,borderRadius:10,background:"linear-gradient(135deg,#c9a96e,#8b6914)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,boxShadow:"0 0 20px rgba(201,169,110,0.3)" }}>∞</div>
+          <div>
+            <div style={{ fontWeight:"bold",fontSize:15,letterSpacing:"0.05em",color:"#c9a96e" }}>AGENT PEA ELITE</div>
+            <div style={{ fontSize:10,color:"#888",letterSpacing:"0.1em" }}>YAHOO · ALPHA VANTAGE · FMP · TEMPS RÉEL</div>
+          </div>
+        </div>
+        {totalActuel>0 && (
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:17,fontWeight:"bold",color:totalPnL>=0?"#4a9e6b":"#e05555" }}>{Math.round(totalActuel).toLocaleString('fr-FR')} €</div>
+            <div style={{ fontSize:11,color:totalPnL>=0?"#4a9e6b":"#e05555" }}>{totalPnL>=0?"+":""}{Math.round(totalPnL).toLocaleString('fr-FR')} € ({totalPnLPct>=0?"+":""}{totalPnLPct.toFixed(2)}%)</div>
+          </div>
+        )}
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display:"flex",borderBottom:"1px solid rgba(201,169,110,0.15)",padding:"0 24px",background:"rgba(0,0,0,0.2)" }}>
+        {[{id:"chat",label:"💬 Assistant"},{id:"dashboard",label:"📊 Portefeuille"},{id:"realloc",label:"🔄 Rééquilibrage"}].map(tab=>(
+          <button key={tab.id} onClick={()=>setActiveTab(tab.id)} style={{ background:"none",border:"none",cursor:"pointer",padding:"11px 18px",fontSize:13,color:activeTab===tab.id?"#c9a96e":"#666",borderBottom:activeTab===tab.id?"2px solid #c9a96e":"2px solid transparent",fontFamily:"inherit",letterSpacing:"0.05em" }}>
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── DASHBOARD ── */}
+      {activeTab==="dashboard" && (
+        <div style={{ padding:20,maxWidth:1150,margin:"0 auto" }}>
+          {apiWarning && (
+            <div style={{ background:"rgba(224,153,85,0.08)",border:"1px solid rgba(224,153,85,0.4)",borderRadius:10,padding:"12px 18px",marginBottom:16,fontSize:13,color:"#e09955" }}>
+              ⚠️ <strong>Clés API manquantes</strong> — Les prix en temps réel nécessitent Alpha Vantage et/ou FMP. Seul Yahoo Finance (non officiel) est actif. Ajoutez vos clés en haut du code (<code>ALPHA_VANTAGE_KEY</code>, <code>FMP_KEY</code>).
+            </div>
+          )}
+          {lines.length===0 ? (
+            <div style={{ textAlign:"center",padding:"60px 20px",color:"#555" }}>
+              <div style={{ fontSize:48,marginBottom:16 }}>📭</div>
+              <div style={{ fontSize:16,color:"#888",marginBottom:8 }}>Aucune ligne dans le portefeuille</div>
+              <div style={{ fontSize:13,color:"#555" }}>Demandez une allocation dans l'assistant et importez-la en un clic.</div>
+            </div>
+          ) : (
+            <>
+              {hasPending && (
+                <div style={{ background:"rgba(201,169,110,0.08)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:10,padding:"11px 16px",marginBottom:14,fontSize:13,color:"#c9a96e" }}>
+                  ✏️ Complétez la quantité et le PRU de chaque ligne, puis cliquez sur "Actualiser les prix".
+                </div>
+              )}
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16 }}>
+                {[
+                  {label:"Valeur actuelle",value:`${Math.round(totalActuel).toLocaleString('fr-FR')} €`,color:"#c9a96e"},
+                  {label:"PRU total",value:`${Math.round(totalPRU).toLocaleString('fr-FR')} €`,color:"#888"},
+                  {label:"Plus-value",value:`${totalPnL>=0?"+":""}${Math.round(totalPnL).toLocaleString('fr-FR')} €`,color:totalPnL>=0?"#4a9e6b":"#e05555"},
+                  {label:"Performance",value:`${totalPnLPct>=0?"+":""}${totalPnLPct.toFixed(2)}%`,color:totalPnLPct>=0?"#4a9e6b":"#e05555"},
+                ].map((k,i)=>(
+                  <div key={i} style={{ background:"rgba(15,15,25,0.8)",border:"1px solid rgba(201,169,110,0.2)",borderRadius:10,padding:"14px 16px" }}>
+                    <div style={{ fontSize:10,color:"#888",letterSpacing:"0.08em",marginBottom:5 }}>{k.label}</div>
+                    <div style={{ fontSize:19,fontWeight:"bold",color:k.color }}>{k.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Refresh bar */}
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,padding:"10px 16px",background:"rgba(15,15,25,0.6)",border:"1px solid rgba(201,169,110,0.15)",borderRadius:10 }}>
+                <div style={{ fontSize:12,color:"#666" }}>
+                  {lastRefresh ? `⏱ Dernière actualisation : ${lastRefresh}` : "Aucune actualisation effectuée"}
+                </div>
+                <button onClick={refreshPrices} disabled={refreshing} style={{ background:refreshing?"rgba(201,169,110,0.1)":"linear-gradient(135deg,#c9a96e,#8b6914)",border:"none",borderRadius:8,padding:"7px 18px",cursor:refreshing?"not-allowed":"pointer",color:refreshing?"#888":"#000",fontWeight:"bold",fontSize:12,fontFamily:"inherit",display:"flex",alignItems:"center",gap:6 }}>
+                  <span style={{ display:"inline-block",animation:refreshing?"spin 1s linear infinite":"none" }}>⟳</span>
+                  {refreshing?"Actualisation…":"Actualiser les prix (3 sources)"}
+                </button>
+              </div>
+
+              <div style={{ background:"rgba(15,15,25,0.8)",border:"1px solid rgba(201,169,110,0.2)",borderRadius:12,overflow:"auto" }}>
+                <div style={{ padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid rgba(201,169,110,0.15)" }}>
+                  <span style={{ fontSize:13,letterSpacing:"0.1em",color:"#c9a96e",fontWeight:"bold" }}>LIGNES DU PORTEFEUILLE</span>
+                  <button onClick={()=>setShowAddForm(!showAddForm)} style={{ background:"rgba(201,169,110,0.1)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:8,padding:"5px 12px",cursor:"pointer",color:"#c9a96e",fontSize:12,fontFamily:"inherit" }}>
+                    {showAddForm?"✕ Annuler":"+ Ajouter"}
+                  </button>
+                </div>
+
+                {showAddForm && (
+                  <div style={{ padding:"14px 18px",borderBottom:"1px solid rgba(201,169,110,0.1)",background:"rgba(201,169,110,0.03)",display:"flex",flexWrap:"wrap",gap:10,alignItems:"flex-end" }}>
+                    {[["Ticker","ticker","text"],["Nom","nom","text"],["Qté","qte","number"],["PRU €","pru","number"],["Prix actuel €","prixActuel","number"],["Cible %","cible","number"]].map(([lbl,key,type])=>(
+                      <div key={key}>
+                        <div style={{ fontSize:10,color:"#888",marginBottom:4 }}>{lbl}</div>
+                        <input type={type} value={newLine[key]} onChange={e=>setNewLine(p=>({...p,[key]:type==="number"?parseFloat(e.target.value)||0:e.target.value}))}
+                          style={{ width:key==="nom"?150:75,background:"rgba(0,0,0,0.4)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:6,padding:"5px 7px",color:"#e8e0d0",fontSize:13,fontFamily:"monospace" }}/>
+                      </div>
+                    ))}
+                    <div>
+                      <div style={{ fontSize:10,color:"#888",marginBottom:4 }}>Catégorie</div>
+                      <select value={newLine.categorie} onChange={e=>setNewLine(p=>({...p,categorie:e.target.value}))}
+                        style={{ background:"rgba(0,0,0,0.6)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:6,padding:"5px 7px",color:"#e8e0d0",fontSize:13,fontFamily:"inherit" }}>
+                        {Object.keys(CAT_COLORS).map(c=><option key={c}>{c}</option>)}
+                      </select>
+                    </div>
+                    <button onClick={addLine} style={{ background:"linear-gradient(135deg,#c9a96e,#8b6914)",border:"none",borderRadius:8,padding:"7px 16px",cursor:"pointer",color:"#000",fontWeight:"bold",fontSize:13,fontFamily:"inherit" }}>Ajouter</button>
+                  </div>
+                )}
+
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Ticker</th><th>Nom</th><th>Cat.</th>
+                      <th>Qté</th><th>PRU</th><th>Prix temps réel</th>
+                      <th>Sources</th><th>Valeur</th><th>PnL €</th><th>PnL %</th>
+                      <th>Poids</th><th>Cible</th><th>Écart</th><th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {lineRows.map(l=>{
+                      const pd = priceData[l.ticker];
+                      return (
+                        <tr key={l.id}>
+                          <td><span style={{ fontFamily:"monospace",fontWeight:"bold",color:"#c9a96e" }}>{l.ticker}</span></td>
+                          <td style={{ fontSize:12,color:"#aaa",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{l.nom}</td>
+                          <td><span style={{ fontSize:10,padding:"2px 6px",borderRadius:20,background:CAT_COLORS[l.categorie]+"22",color:CAT_COLORS[l.categorie],whiteSpace:"nowrap" }}>{l.categorie}</span></td>
+                          <td>{l.ticker!=="CASH"?<EditableCell value={l.qte} onSave={v=>updateLine(l.id,"qte",v)}/>:"—"}</td>
+                          <td><EditableCell value={l.pru} onSave={v=>updateLine(l.id,"pru",v)} suffix=" €"/></td>
+                          <td>
+                            <div style={{ display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2 }}>
+                              <EditableCell value={l.prixActuel} onSave={v=>updateLine(l.id,"prixActuel",v)} suffix=" €"/>
+                              {pd && <span style={{ fontSize:9,color:"#4a9e6b" }}>● live</span>}
+                            </div>
+                          </td>
+                          <td style={{ fontSize:10 }}>
+                            {pd ? <SourceBadges sources={pd.sources}/> : <span style={{ color:"#444" }}>—</span>}
+                          </td>
+                          <td style={{ fontFamily:"monospace" }}>{Math.round(l.valActuelle).toLocaleString('fr-FR')} €</td>
+                          <td style={{ color:l.pnl>=0?"#4a9e6b":"#e05555",fontFamily:"monospace" }}>{l.ticker!=="CASH"?(l.pnl>=0?"+":"")+Math.round(l.pnl).toLocaleString('fr-FR')+" €":"—"}</td>
+                          <td style={{ color:l.pnlPct>=0?"#4a9e6b":"#e05555",fontFamily:"monospace" }}>{l.ticker!=="CASH"?(l.pnlPct>=0?"+":"")+l.pnlPct.toFixed(1)+"%":"—"}</td>
+                          <td style={{ fontFamily:"monospace" }}>{l.pctActuel.toFixed(1)}%</td>
+                          <td><EditableCell value={l.cible} onSave={v=>updateLine(l.id,"cible",v)} suffix="%"/></td>
+                          <td style={{ color:Math.abs(l.ecartCible)>3?"#e09955":Math.abs(l.ecartCible)>1?"#e0d555":"#888",fontFamily:"monospace" }}>
+                            {l.ecartCible>=0?"+":""}{l.ecartCible.toFixed(1)}%
+                          </td>
+                          <td><button onClick={()=>deleteLine(l.id)} style={{ background:"none",border:"none",cursor:"pointer",color:"#555",fontSize:14 }}>✕</button></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div style={{ padding:"10px 18px",fontSize:11,color:"#555" }}>
+                  💡 Cliquez sur une valeur pour la modifier • Les prix temps réel sont tirés de la médiane de 3 sources (Yahoo Finance, Alpha Vantage, FMP)
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── RÉÉQUILIBRAGE ── */}
+      {activeTab==="realloc" && (
+        <div style={{ padding:20,maxWidth:900,margin:"0 auto" }}>
+          {lines.length===0 ? (
+            <div style={{ textAlign:"center",padding:"60px 20px" }}>
+              <div style={{ fontSize:48,marginBottom:16 }}>📭</div>
+              <div style={{ fontSize:14,color:"#888" }}>Importez d'abord une allocation depuis l'assistant.</div>
+            </div>
+          ) : (
+            <>
+              <div style={{ background:"rgba(15,15,25,0.8)",border:"1px solid rgba(201,169,110,0.2)",borderRadius:12,padding:22,marginBottom:18 }}>
+                <div style={{ fontSize:13,color:"#c9a96e",letterSpacing:"0.1em",fontWeight:"bold",marginBottom:16 }}>ÉCARTS PAR RAPPORT AUX CIBLES</div>
+                {lineRows.map(l=>{
+                  const col = Math.abs(l.ecartCible)>3?"#e09955":Math.abs(l.ecartCible)>1?"#e0d555":"#4a9e6b";
+                  return (
+                    <div key={l.id} style={{ marginBottom:14 }}>
+                      <div style={{ display:"flex",justifyContent:"space-between",marginBottom:5 }}>
+                        <span style={{ fontSize:13 }}><span style={{ color:"#c9a96e",fontFamily:"monospace",fontWeight:"bold" }}>{l.ticker}</span> <span style={{ color:"#888",fontSize:12 }}>{l.nom}</span></span>
+                        <span style={{ fontSize:12,fontFamily:"monospace",color:col }}>{l.pctActuel.toFixed(1)}% / {l.cible}% ({l.ecartCible>=0?"+":""}{l.ecartCible.toFixed(1)}%)</span>
+                      </div>
+                      <div style={{ height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden" }}>
+                        <div style={{ width:`${Math.min(l.pctActuel,100)}%`,height:"100%",background:`linear-gradient(90deg,${col}66,${col})`,borderRadius:3 }}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ textAlign:"center",marginBottom:18 }}>
+                <button onClick={runRealloc} disabled={reallocLoading} style={{ background:reallocLoading?"rgba(201,169,110,0.2)":"linear-gradient(135deg,#c9a96e,#8b6914)",border:"none",borderRadius:12,padding:"13px 36px",cursor:reallocLoading?"not-allowed":"pointer",color:reallocLoading?"#888":"#000",fontWeight:"bold",fontSize:14,fontFamily:"inherit" }}>
+                  {reallocLoading?"⏳ Analyse en cours…":"🔄 Lancer l'analyse de rééquilibrage IA"}
+                </button>
+              </div>
+              {reallocResult && (
+                <div style={{ background:"rgba(15,15,25,0.9)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:12,padding:22 }}>
+                  <div style={{ fontSize:11,color:"#c9a96e",letterSpacing:"0.1em",marginBottom:12,fontWeight:"bold" }}>✦ RECOMMANDATIONS</div>
+                  <div style={{ fontSize:14,lineHeight:1.8,color:"#e8e0d0",whiteSpace:"pre-wrap",fontFamily:"Georgia,serif" }}>{reallocResult}</div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── CHAT ── */}
+      {activeTab==="chat" && (
+        <div style={{ display:"flex",flexDirection:"column",height:"calc(100vh - 118px)" }}>
+          <div style={{ padding:"10px 14px",display:"flex",gap:8,overflowX:"auto",borderBottom:"1px solid rgba(201,169,110,0.1)",background:"rgba(0,0,0,0.2)" }}>
+            {QUICK_PROMPTS.map((p,i)=>(
+              <button key={i} onClick={()=>sendMessage(p.text)} disabled={loading} style={{ flexShrink:0,background:"rgba(201,169,110,0.07)",border:"1px solid rgba(201,169,110,0.25)",borderRadius:20,padding:"6px 13px",cursor:"pointer",fontSize:12,color:"#c9a96e",fontFamily:"inherit",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:5 }}>
+                <span>{p.icon}</span>{p.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ flex:1,overflowY:"auto",padding:"22px 18px" }}>
+            <div style={{ maxWidth:760,margin:"0 auto" }}>
+              {messages.map((msg,i)=>(
+                <div key={i} className="msg-in"><Message msg={msg} onImport={importAllocation}/></div>
+              ))}
+              {loading && (
+                <div style={{ display:"flex",gap:12,alignItems:"flex-start",marginBottom:20 }}>
+                  <div style={{ width:36,height:36,borderRadius:"50%",background:"linear-gradient(135deg,#1a1a2e,#16213e)",display:"flex",alignItems:"center",justifyContent:"center",border:"1px solid #c9a96e33",fontSize:14,color:"#c9a96e" }}>∞</div>
+                  <div style={{ background:"rgba(15,15,25,0.9)",border:"1px solid rgba(201,169,110,0.2)",borderRadius:"4px 18px 18px 18px" }}><TypingIndicator/></div>
+                </div>
+              )}
+              <div ref={messagesEndRef}/>
+            </div>
+          </div>
+          <div style={{ padding:"14px 18px",background:"rgba(0,0,0,0.5)",borderTop:"1px solid rgba(201,169,110,0.15)",backdropFilter:"blur(20px)" }}>
+            <div style={{ maxWidth:760,margin:"0 auto",display:"flex",gap:10 }}>
+              <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();if(input.trim())sendMessage(input.trim());}}} placeholder="Posez votre question sur votre PEA… (Entrée pour envoyer)" rows={2}
+                style={{ flex:1,background:"rgba(15,15,25,0.8)",border:"1px solid rgba(201,169,110,0.3)",borderRadius:12,padding:"11px 15px",color:"#e8e0d0",fontSize:14,fontFamily:"inherit",lineHeight:1.5,resize:"none" }}/>
+              <button onClick={()=>{if(input.trim())sendMessage(input.trim());}} disabled={loading||!input.trim()}
+                style={{ width:46,height:46,alignSelf:"flex-end",background:input.trim()&&!loading?"linear-gradient(135deg,#c9a96e,#8b6914)":"rgba(201,169,110,0.2)",border:"none",borderRadius:12,cursor:input.trim()&&!loading?"pointer":"not-allowed",fontSize:18,color:input.trim()&&!loading?"#000":"#666" }}>↑</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
